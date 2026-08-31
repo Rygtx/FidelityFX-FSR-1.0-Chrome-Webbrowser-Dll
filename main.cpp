@@ -21,6 +21,7 @@
 #pragma comment(lib,"d3d11.lib")
 #pragma comment(lib,"dxgi.lib")
 #pragma comment(lib,"d3dcompiler.lib")
+#pragma comment(lib,"user32.lib")
 
 using namespace DirectX;
 using Microsoft::WRL::ComPtr;
@@ -59,6 +60,12 @@ using VideoProcessorBlt_t = HRESULT(STDMETHODCALLTYPE*)(
     const D3D11_VIDEO_PROCESSOR_STREAM*);
 
 VideoProcessorBlt_t oVideoProcessorBlt = nullptr;
+
+enum class ColorSpaceDirection
+{
+    YuvToRgb,
+    RgbToYuv
+};
 
 class FSRPipeline
 {
@@ -451,11 +458,13 @@ public:
     [[nodiscard]] bool ConvertToFormat(
         D3D11Context& d3dContext,
         ID3D11VideoContext* videoContext,
+        ID3D11VideoProcessor* referenceProcessor,
         ID3D11Texture2D* sourceTexture,
         ID3D11Texture2D* destTexture,
         const D3D11_TEXTURE2D_DESC& sourceDesc,
         const D3D11_TEXTURE2D_DESC& destDesc,
         UINT outputFrame,
+        ColorSpaceDirection direction,
         std::optional<const D3D11_VIDEO_PROCESSOR_STREAM*> inputStream = std::nullopt)
     {
         ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
@@ -483,6 +492,29 @@ public:
         {
             return false;
         }
+
+        // Inherit color space state from the caller's processor: a fresh processor has
+        // driver-default state that can leave limited-range YUV unexpanded (washed-out image).
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE streamCS{};
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE outputCS{};
+
+        if (direction == ColorSpaceDirection::YuvToRgb)
+        {
+            videoContext->VideoProcessorGetStreamColorSpace(referenceProcessor, 0, &streamCS);
+
+            outputCS.RGB_Range = 0; // full range 0-255
+            outputCS.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+        }
+        else
+        {
+            videoContext->VideoProcessorGetOutputColorSpace(referenceProcessor, &outputCS);
+
+            streamCS.RGB_Range = 0; // full range 0-255
+            streamCS.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+        }
+
+        videoContext->VideoProcessorSetStreamColorSpace(processor.Get(), 0, &streamCS);
+        videoContext->VideoProcessorSetOutputColorSpace(processor.Get(), &outputCS);
 
         ComPtr<ID3D11VideoProcessorOutputView> outputView;
         D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputViewDesc = {
@@ -672,11 +704,13 @@ HRESULT STDMETHODCALLTYPE hkVideoProcessorBlt(
     if (!videoProc.ConvertToFormat(
         d3dContext,
         videoContext,
+        videoProcessor,
         inputTexture.Get(),
         tempInputTexture.Get(),
         inputDesc,
         tempInputDesc,
         outputFrame,
+        ColorSpaceDirection::YuvToRgb,
         &streams[0]))
     {
         return oVideoProcessorBlt(videoContext, videoProcessor, outputView,
@@ -695,11 +729,13 @@ HRESULT STDMETHODCALLTYPE hkVideoProcessorBlt(
         if (!videoProc.ConvertToFormat(
             d3dContext,
             videoContext,
+            videoProcessor,
             pipeline.GetOutputTexture(),
             outputTexture.Get(),
             outputDesc,
             outputDesc,
-            outputFrame))
+            outputFrame,
+            ColorSpaceDirection::RgbToYuv))
         {
             return oVideoProcessorBlt(videoContext, videoProcessor, outputView,
                 outputFrame, streamCount, streams);
